@@ -1,0 +1,8 @@
+.env
+.venv
+docs/
+faiss_index/
+crawl_doc.py
+chat.py
+test1.py
+*.pyc

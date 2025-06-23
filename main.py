@@ -1,187 +1,204 @@
-from langgraph.graph import StateGraph
+from typing_extensions import Literal, TypedDict
+from pydantic import BaseModel, Field
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END
 import os
 import pandas as pd
 from fastapi import FastAPI
 from dotenv import load_dotenv
 from langchain.schema import Document
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain_openai import ChatOpenAI
-from langchain.agents import tool, initialize_agent, AgentType
-from langchain.tools.render import render_text_description
-from pydantic import BaseModel
-from typing import Optional
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
 
 # Load environment
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
-docs = []
-categories = {}
 
+# Load data
+categories = {}
 xl = pd.ExcelFile("subsections_xlsxwriter.xlsx")
 for sheet in xl.sheet_names:
-    # Lưu category
     categories[sheet.lower()] = sheet
-    df_cat = xl.parse(sheet_name=sheet)
-    for _, row in df_cat.iterrows():
-        name = row.get('Tên sản phẩm', '')
-        # Lưu product name
-        docs.append(Document(
-            page_content=f"Product name: {name}",
-            metadata={"type": "product_name"}
-        ))
-        # Lưu product detail
-        detail = f"""Tên sản phẩm: {name}
-Danh mục: {sheet}
-Giá: {row.get('Giá', '')}
-Khối lượng: {row.get('Khối lượng', '')}
-Mô tả: {row.get('Mô tả', '')}
-Mô tả đủ: {row.get('Mô tả đủ', '')}
-Hướng dẫn sử dụng: {row.get('Hướng dẫn sử dụng', '')}
-Thành phần: {row.get('Thành phần', '')}
-Thương hiệu: {row.get('Thương hiệu', '')}
-Hình ảnh: {row.get('Hình ảnh', '')}
-"""
-        docs.append(Document(
-            page_content=detail,
-            metadata={
-                "type": "product_detail",
-            }
-        ))
-
-
-for cat in categories.keys():
-    docs.append(Document(
-        page_content=f"Category: {cat}",
-        metadata={"type": "category"}
-    ))
-
-if False:
-    # Tạo FAISS với metadata
-    embedding = OpenAIEmbeddings()
-    batch_size = 100  # hoặc 1000 tuỳ lượng data
-    vectorstore = None
-
-    for i in range(0, len(docs), batch_size):
-        batch = docs[i:i+batch_size]
-        if vectorstore is None:
-            vectorstore = FAISS.from_documents(batch, embedding)
-        else:
-            vectorstore.add_documents(batch)
-
-    vectorstore.save_local("faiss_index")
-    retriever = vectorstore.as_retriever()
-    # Định nghĩa tools
 
 embedding = OpenAIEmbeddings()
 vectorstore = FAISS.load_local(
     "faiss_index", embedding, allow_dangerous_deserialization=True)
 retriever = vectorstore.as_retriever()
 
+llm = ChatOpenAI(
+    model="gpt-4o",
+    temperature=0,
+)
 
-@tool
-def list_categories(input: str) -> str:
-    """Liệt kê các danh mục sản phẩm chi theo 2 cấp."""
-    return open("docs/thong_tin_danh_muc.txt", "r", encoding="utf-8").read()
+SYSTEM_PROMPT = "Luôn trả lời bằng tiếng Việt, không quá 500 chữ."
 
+# --- ROUTING SCHEMA ---
+class Route(BaseModel):
+    step: Literal[
+        "list_categories",
+        "get_products_by_category",
+        "search_products",
+        "suggest_products",
+        "get_production_info"
+    ] = Field(None, description="Bước tiếp theo trong quá trình routing")
+    category: str = Field(None, description="Tên danh mục sản phẩm nếu có")
+    product_name: str = Field(None, description="Tên sản phẩm nếu có")
 
-@tool
-def get_products_by_category(input: str) -> str:
-    """Trả về danh sách sản phẩm theo tên category (danh mục), đọc từ sheet cùng tên trong file subsections_xlsm."""
-    import pandas as pd
+router = llm.with_structured_output(Route)
+
+# --- STATE ---
+class State(TypedDict):
+    input: str
+    decision: str
+    output: str
+    category: str
+    product_name: str
+
+# --- NODES ---
+def node_list_categories(state: State):
+    with open("docs/thong_tin_danh_muc.txt", "r", encoding="utf-8") as f:
+        result = f.read()
+    return {"output": result}
+
+def node_get_products_by_category(state: State):
+    """Trả về danh sách sản phẩm theo tên category (danh mục)"""
+    input_category = state.get("category") or state["input"]
+    input_lower = input_category.lower().strip()
+    print(f"Input category: {input_lower}")
+    print(f"Available categories: {categories.keys()}")
     try:
-        # Lấy danh sách sheet
-        if input.lower() not in categories:
-            return (
-                f"Không tìm thấy danh mục (sheet) '{input}' trong file Excel.\n"
-                f"Các danh mục hiện có: {', '.join(categories.keys())}"
-            )
-        # Đọc sheet theo tên category (input)
-        df_cat = xl.parse(sheet_name=categories[input.lower()])
+        if input_lower not in categories:
+            return {
+                "output": (
+                    f"Không tìm thấy danh mục (sheet) '{input_category}' trong file Excel.\n"
+                    f"Các danh mục hiện có: {', '.join(categories.keys())}"
+                )
+            }
+        df_cat = xl.parse(sheet_name=categories[input_lower])
     except Exception as e:
-        return f"Lỗi khi đọc file: {e}"
+        return {"output": f"Lỗi khi đọc file: {e}"}
     if df_cat.empty:
-        return f"Không có sản phẩm nào trong danh mục '{input}'."
+        return {"output": f"Không có sản phẩm nào trong danh mục '{input_category}'."}
     lines = []
     for _, row in df_cat.iterrows():
         name = row.get('Tên sản phẩm', 'Không rõ')
         price = row.get('Giá', 'Không rõ')
         brand = row.get('Thương hiệu', 'Không có')
         lines.append(f"- {name} | Giá: {price} | thương hiệu: {brand}")
-    print(f"Đã tìm thấy {len(lines)} sản phẩm trong danh mục '{input}'.")
-    return "\n".join(lines)
+    return {"output": "\n".join(lines)}
 
+def node_search_products(state: State):
+    matches = retriever.get_relevant_documents(state["input"])
+    print(f"Found {len(matches)} matches for search query: {state['input']}")
+    if not matches:
+        return {"output": "Không tìm thấy sản phẩm nào phù hợp."}
+    return {"output": "\n\n".join([doc.page_content for doc in matches[:5]])}
 
-@tool
-def search_products(input: str) -> str:
-    """Tìm kiếm sản phẩm theo từ khóa."""
-    matches = retriever.get_relevant_documents(input)
-    return "\n\n".join([doc.page_content for doc in matches[:5]])
+def node_suggest_products(state: State):
+    matches = retriever.get_relevant_documents("gợi ý " + state["input"])
+    if not matches:
+        return {"output": "Không có gợi ý phù hợp."}
+    return {"output": "\n\n".join([doc.page_content for doc in matches[:3]])}
 
-
-@tool
-def suggest_products(input: str) -> str:
-    """Gợi ý sản phẩm dựa trên từ khóa."""
-    matches = retriever.get_relevant_documents("gợi ý " + input)
-    return "\n\n".join([doc.page_content for doc in matches[:3]])
-
-
-@tool
-def get_production_info(input: str) -> str:
+def node_get_production_info(state: State):
     """Tìm thông tin sản phẩm gần đúng trong FAISS (semantic search)."""
-    matches = retriever.get_relevant_documents(input)
-    # Lọc chỉ các document có type là product_detail
+    query = state.get("product_name") or state["input"]
+    matches = retriever.get_relevant_documents(query)
     product_details = [doc for doc in matches if doc.metadata.get("type") == "product_detail"]
     if product_details:
-        return "\n\n".join(doc.page_content for doc in product_details[:3])
-    # Nếu không có, trả về gợi ý tên sản phẩm gần đúng (nếu có)
+        return {"output": "\n\n".join(doc.page_content for doc in product_details[:3])}
     suggestions = [
         doc.page_content for doc in matches if doc.metadata.get("type") == "product_name"
     ]
     if suggestions:
-        return (
-            "Không tìm thấy thông tin chi tiết, bạn có muốn hỏi về một trong các sản phẩm sau không?\n- "
-            + "\n- ".join(suggestions[:5])
-        )
-    return "Không tìm thấy sản phẩm nào phù hợp."
+        return {
+            "output": (
+                "Không tìm thấy thông tin chi tiết, bạn có muốn hỏi về một trong các sản phẩm sau không?\n- "
+                + "\n- ".join(suggestions[:5])
+            )
+        }
+    return {"output": "Không tìm thấy sản phẩm nào phù hợp."}
 
+def node_router(state: State):
+    """Route input đến node phù hợp"""
+    decision = router.invoke(
+        [
+            SystemMessage(
+                content=SYSTEM_PROMPT + "\nRoute truy vấn của người dùng đến một trong các bước: list_categories, get_products_by_category, search_products, suggest_products, get_production_info dựa trên ý định. Nếu có, hãy trích xuất cả tên danh mục (category) và tên sản phẩm (product_name)."
+            ),
+            HumanMessage(content=state["input"]),
+        ]
+    )
+    print(f"Decision made: {decision.step}, category: {getattr(decision, 'category', None)}, product_name: {getattr(decision, 'product_name', None)}")
+    return {
+        "decision": decision.step,
+        "category": getattr(decision, "category", None),
+        "product_name": getattr(decision, "product_name", None)
+    }
 
-# Kết hợp tools
-tools = [list_categories, get_products_by_category,
-         search_products, suggest_products, get_production_info]
+# --- ROUTING LOGIC ---
+def route_decision(state: State):
+    if state["decision"] == "list_categories":
+        return "node_list_categories"
+    elif state["decision"] == "get_products_by_category":
+        return "node_get_products_by_category"
+    elif state["decision"] == "search_products":
+        return "node_search_products"
+    elif state["decision"] == "suggest_products":
+        return "node_suggest_products"
+    elif state["decision"] == "get_production_info":
+        return "node_get_production_info"
 
-# Tạo LLM hỗ trợ tool
-llm = ChatOpenAI(model="gpt-4o", temperature=0)
+def node_llm_postprocess(state: State):
+    """Xử lý kết quả đầu ra bằng LLM trước khi trả về, sử dụng context là kết quả truy vấn và input là câu hỏi gốc."""
+    print(f"Postprocessing output with context: {state['output']}")
+    messages = [
+        SystemMessage(
+            content=(
+                "Bạn hãy dựa vào phần context dưới đây để trả lời câu hỏi của người dùng. "
+                "Nếu context không liên quan hoặc không đủ thông tin, hãy trả lời lịch sự rằng bạn không tìm thấy kết quả phù hợp. "
+                "Đảm bảo trả lời bằng tiếng Việt, không quá 500 chữ.\n\n"
+                f"Context:\n{state['output']}"
+            )
+        ),
+        HumanMessage(content=state["input"])
+    ]
+    result = llm.invoke(messages)
+    return {"output": result.content}
 
-# Tạo agent executor để LLM thực thi tool thực sự
-agent = initialize_agent(
-    tools,
-    llm,
-    agent=AgentType.OPENAI_FUNCTIONS,
-    verbose=True
+# --- BUILD WORKFLOW ---
+router_builder = StateGraph(State)
+router_builder.add_node("node_list_categories", node_list_categories)
+router_builder.add_node("node_get_products_by_category", node_get_products_by_category)
+router_builder.add_node("node_search_products", node_search_products)
+router_builder.add_node("node_suggest_products", node_suggest_products)
+router_builder.add_node("node_get_production_info", node_get_production_info)
+router_builder.add_node("node_router", node_router)
+router_builder.add_node("node_llm_postprocess", node_llm_postprocess)
+
+router_builder.add_edge(START, "node_router")
+router_builder.add_conditional_edges(
+    "node_router",
+    route_decision,
+    {
+        "node_list_categories": "node_list_categories",
+        "node_get_products_by_category": "node_get_products_by_category",
+        "node_search_products": "node_search_products",
+        "node_suggest_products": "node_suggest_products",
+        "node_get_production_info": "node_get_production_info",
+    },
 )
+# Kết nối các node kết quả về node_llm_postprocess thay vì END
+router_builder.add_edge("node_list_categories", "node_llm_postprocess")
+router_builder.add_edge("node_get_products_by_category", "node_llm_postprocess")
+router_builder.add_edge("node_search_products", "node_llm_postprocess")
+router_builder.add_edge("node_suggest_products", "node_llm_postprocess")
+router_builder.add_edge("node_get_production_info", "node_llm_postprocess")
+router_builder.add_edge("node_llm_postprocess", END)
 
+router_workflow = router_builder.compile()
 
-class ChatState(BaseModel):
-    input: str
-    result: Optional[str] = None
-
-
-def process_node(state):
-    question = "Trả lời bằng tiếng Việt, không quá 500 chữ. " + state.input
-    print(f"\n[Agent] Nhận câu hỏi: {question}")
-    result = agent.run(question)
-    print(f"[Agent] Kết quả Agent: {result}")
-    return {"result": result}
-
-
-# Nếu bạn vẫn muốn giữ LangGraph flow:
-
-builder = StateGraph(state_schema=ChatState)
-builder.add_node("chat_with_tools", process_node)
-builder.set_entry_point("chat_with_tools")
-graph = builder.compile()
-
+# --- FASTAPI ---
 app = FastAPI()
 
 class ChatRequest(BaseModel):
@@ -192,5 +209,5 @@ class ChatResponse(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse)
 def chat_endpoint(req: ChatRequest):
-    output = graph.invoke({"input": req.question})
-    return ChatResponse(answer=output["result"])
+    state = router_workflow.invoke({"input": req.question})
+    return ChatResponse(answer=state["output"])
